@@ -1,5 +1,5 @@
 """
-rtgd.py
+rtd.py
 
 A WeeWX service to generate various near realtime data files.
 
@@ -113,10 +113,8 @@ class RealtimeData(StdService):
             # we have no generator objects so we have nothing to do so return
             return
         else:
-            # we have at least one generator
-            # start all of my generators
-            for thread in self.generators:
-                thread['object'].start()
+            self.manager_dict = weewx.manager.get_manager_dict_from_config(config_dict,
+                                                                           'wx_binding')
             now = time.time()
             start_ts = weeutil.weeutil.startOfDay(now)
             end_dt = datetime.datetime.fromtimestamp(start_ts) + datetime.timedelta(days=1)
@@ -127,12 +125,15 @@ class RealtimeData(StdService):
             if day_stats:
                 self.buffer.std_unit_system = self.db_manager.std_unit_system
                 self.buffer.seed(day_stats)
+            # we have at least one generator
+            # start all of my generators
+            for thread in self.generators:
+                thread['object'].start()
+
             # bind ourself to the relevant WeeWX events
             self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
             # self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
 
-            manager_dict = weewx.manager.get_manager_dict_from_config(config_dict,
-                                                                      'wx_binding')
             self.db_manager = weewx.manager.open_manager(manager_dict)
             # setup our loop cache and set some starting wind values
             _ts = self.db_manager.lastGoodStamp()
@@ -140,9 +141,8 @@ class RealtimeData(StdService):
                 _rec = self.db_manager.getRecord(_ts)
             else:
                 _rec = {'usUnits': None}
-            # get a CachedPacket object as our loop packet cache and prime it with
-            # values from the last good archive record if available
-            self.packet_cache = CachedPacket(_rec)
+            # get a CachedPacket object as our loop packet cache
+            self.packet_cache = CachedPacket()
 
     def thread_factory(self, generator, generator_config, engine):
         """Factory method to produce a generator thread object."""
@@ -159,13 +159,14 @@ class RealtimeData(StdService):
         control_queue = queue.Queue()
         data_queue = queue.Queue()
         # now get the generator object
-        generator_obj = generator_class(control_queue,
-                                        data_queue,
-                                        engine,
-                                        generator_config)
+        generator_obj = generator_class(control_queue=control_queue,
+                                        result_queue=data_queue,
+                                        engine=engine,
+                                        config_dict=generator_config,
+                                        manager_dict=self.manager_dict,
+                                        lock=self.buffer.lock)
         # finally add our generator object and
-        self.generators.append({'name': 'fred',
-                                'object': generator_obj,
+        self.generators.append({'object': generator_obj,
                                 'control_queue': control_queue,
                                 'data_queue': data_queue})
 
@@ -175,7 +176,7 @@ class RealtimeData(StdService):
         # update the buffer with the loop packet
         self.buffer.add_packet(event.packet)
         # update the packet cache
-        self.packet_cache.update()
+        self.packet_cache.update(event.packet, event.packet['dateTime'])
         # get a cached packet
         _cached_packet = self.packet_cache.get_packet(ts=event.packet['dateTime'])
         # package the loop packet in a dict since this is not the only data
@@ -762,8 +763,10 @@ class CachedPacket(object):
            "barometer", "radiation", "rain", "rainRate", "windSpeed",
            "appTemp", "dewpoint", "heatindex", "humidex", "inTemp",
            "outTemp", "windchill", "UV", "maxSolarRad"]
+    # fields we ignore when caching a packet
+    IGNORE = ['dateTime', 'usUnits']
 
-    def __init__(self, rec):
+    def __init__(self, rec=None):
         """Initialise our cache object.
 
         The cache needs to be initialised to include all of the fields required
@@ -781,21 +784,16 @@ class CachedPacket(object):
         """
 
         self.cache = dict()
-        # if we have a dateTime field in our record block use that otherwise
-        # use the current system time
-        _ts = rec['dateTime'] if 'dateTime' in rec else int(time.time() + 0.5)
-        # only prime those fields in CachedPacket.OBS
-        for _obs in CachedPacket.OBS:
-            if _obs in rec and 'usUnits' in rec:
-                # only add a value if it exists and we know what units its in
-                self.cache[_obs] = {'value': rec[_obs], 'ts': _ts}
-            else:
-                # otherwise set it to None
-                self.cache[_obs] = {'value': None, 'ts': _ts}
-        # set the cache unit system if known
-        self.std_unit_system = rec['usUnits'] if 'usUnits' in rec else None
+        if rec is not None:
+            # if we have a dateTime field in our record block use that otherwise
+            # use the current system time
+            _ts = rec['dateTime'] if 'dateTime' in rec else int(time.time() + 0.5)
+            # add the packet to the cache
+            self.update(rec, _ts)
+        else:
+            # set the cache unit system if known
+            self.std_unit_system = None
 
-    # TODO. Simplify this signature - ditch ts
     def update(self, packet, ts):
         """Update the cache from a loop packet.
 
@@ -805,11 +803,18 @@ class CachedPacket(object):
         seen before.
         """
 
+        # does our cache have a non-None unit system?
         if self.std_unit_system is None:
+            # we have no unit system so adopt the unit system of the packet
             self.std_unit_system = packet['usUnits']
+        # convert our packet to the cache's unit system
         _conv_packet = weewx.units.to_std_system(packet, self.std_unit_system)
-        for obs in [x for x in _conv_packet if x not in ['dateTime', 'usUnits']]:
+        # iterate over the obs in the packet that we cache and update the cache
+        # as required
+        for obs in [x for x in _conv_packet if x not in CachedPacket.IGNORE]:
+            # we only add non-None observations to the cache
             if _conv_packet[obs] is not None:
+                # add the observation value and it's 'timestamp' to the cache
                 self.cache[obs] = {'value': _conv_packet[obs], 'ts': ts}
 
     def get_value(self, obs, ts, max_age):

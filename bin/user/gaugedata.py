@@ -851,7 +851,7 @@ class RealtimeGaugeDataThread(threading.Thread):
     """Thread that generates gauge-data.txt in near realtime."""
 
     def __init__(self, control_queue, result_queue, config_dict, manager_dict,
-                 latitude, longitude, altitude):
+                 latitude, longitude, altitude, lock):
         # Initialize my superclass:
         threading.Thread.__init__(self)
 
@@ -863,7 +863,7 @@ class RealtimeGaugeDataThread(threading.Thread):
         self.result_queue = result_queue
         self.config_dict = config_dict
         self.manager_dict = manager_dict
-
+        self.lock = lock
         # get our RealtimeGaugeData config dictionary
         rtgd_config_dict = config_dict.get('RealtimeGaugeData', {})
 
@@ -1214,42 +1214,19 @@ class RealtimeGaugeDataThread(threading.Thread):
 
         # get time for debug timing
         t1 = time.time()
-        # if we have the first packet from a new day we need to reset the Buffer
-        # objects stats
-        if self.day_span is not None:
-            # we have a day_span so this i snot our first time, check to see if
-            # our packet timestamp belongs to the following day
-            if packet['dateTime'] > self.day_span.stop:
-                # we have a packet from a new day, so reset the Buffer stats
-                self.buffer.start_of_day_reset()
-                # and reset our day_span
-                self.day_span = weeutil.weeutil.archiveDaySpan(packet['dateTime'])
-        else:
-            # we don't have a day_span, it must be the first packet since we
-            # started, so initialise a day_span
-            self.day_span = weeutil.weeutil.archiveDaySpan(packet['dateTime'])
-        # convert our incoming packet
-        _conv_packet = weewx.units.to_std_system(packet,
-                                                 self.stats_unit_system)
-        # update the packet cache with this packet
-        self.packet_cache.update(_conv_packet, _conv_packet['dateTime'])
-        # update the buffer with the converted packet
-        self.buffer.add_packet(_conv_packet)
+
         # generate if we have no minimum interval setting or if minimum
         # interval seconds have elapsed since our last generation
         if self.min_interval is None or (self.last_write + float(self.min_interval)) < time.time():
-            # get a cached packet
-            cached_packet = self.packet_cache.get_packet(_conv_packet['dateTime'],
-                                                         self.max_cache_age)
             if weewx.debug == 2:
-                log.debug("created cached loop packet (%s)" % cached_packet['dateTime'])
+                log.debug("received cached loop packet (%s)" % packet['dateTime'])
             elif weewx.debug >= 3:
-                log.debug("created cached loop packet: %s" % (cached_packet,))
+                log.debug("received cached loop packet: %s" % (packet,))
             # set our lost contact flag if applicable
-            self.lost_contact_flag = self.get_lost_contact(cached_packet, 'loop')
+            self.lost_contact_flag = self.get_lost_contact(packet, 'loop')
             # get a data dict from which to construct our file
             try:
-                data = self.calculate(cached_packet)
+                data = self.calculate(packet)
             except Exception as e:
                 weeutil.logger.log_traceback(log.info, 'rtgdthread: **** ')
             else:
@@ -1271,7 +1248,7 @@ class RealtimeGaugeDataThread(threading.Thread):
         else:
             # we skipped this packet so log it
             if weewx.debug == 2:
-                log.debug("packet (%s) skipped" % _conv_packet['dateTime'])
+                log.debug("cached packet (%s) skipped" % packet['dateTime'])
 
     def process_stats(self, package):
         """Process a stats package.
