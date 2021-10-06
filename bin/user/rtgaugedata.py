@@ -442,6 +442,7 @@ import time
 from six.moves import queue
 
 # WeeWX imports
+import user.rtd
 import weewx
 import weeutil.logger
 import weeutil.rsyncupload
@@ -844,101 +845,96 @@ class MissingApiKey(IOError):
 
 
 # ============================================================================
-#                       class RealtimeGaugeDataThread
+#                           class GaugeDataThread
 # ============================================================================
 
-class RealtimeGaugeDataThread(threading.Thread):
+class GaugeDataThread(user.rtd.RealtimeDataThread):
     """Thread that generates gauge-data.txt in near realtime."""
 
-    def __init__(self, control_queue, result_queue, config_dict, manager_dict,
-                 latitude, longitude, altitude, lock):
-        # Initialize my superclass:
-        threading.Thread.__init__(self)
+    def __init__(self, control_queue, result_queue, config_dict,
+                 my_config_dict, manager_dict, engine, buffer, buffer_lock):
+        # initialize my superclass
+        super(GaugeDataThread, self).__init__(control_queue, result_queue,
+                                              manager_dict, buffer, buffer_lock)
 
         # setup a few thread things
-        self.setName('RealtimeGaugeDataThread')
-        self.setDaemon(True)
+        self.setName('GaugeDataThread')
 
-        self.control_queue = control_queue
-        self.result_queue = result_queue
-        self.config_dict = config_dict
-        self.manager_dict = manager_dict
-        self.lock = lock
-        # get our RealtimeGaugeData config dictionary
-        rtgd_config_dict = config_dict.get('RealtimeGaugeData', {})
+        self.latitude = engine.stn_info.latitude_f
+        self.longitude = engine.stn_info.longitude_f
+        self.altitude_m = convert(engine.stn_info.altitude_vt, 'meter').value
+        self.station_type = "fred"
 
         # setup file generation timing
-        self.min_interval = rtgd_config_dict.get('min_interval', None)
+        self.min_interval = my_config_dict.get('min_interval', None)
         self.last_write = 0  # ts (actual) of last generation
 
         # get our file paths and names
-        _path = rtgd_config_dict.get('rtgd_path', '/var/tmp')
+        _path = my_config_dict.get('rtgd_path', '/var/tmp')
         _html_root = os.path.join(config_dict['WEEWX_ROOT'],
                                   config_dict['StdReport'].get('HTML_ROOT', ''))
 
-        self.rtgd_path = os.path.join(_html_root, _path)
-        self.rtgd_path_file = os.path.join(self.rtgd_path,
-                                           rtgd_config_dict.get('rtgd_file_name',
+        self.gd_path = os.path.join(_html_root, _path)
+        self.gd_path_file = os.path.join(self.gd_path,
+                                         my_config_dict.get('rtgd_file_name',
                                                                 'gauge-data.txt'))
-        self.rtgd_path_file_tmp = self.rtgd_path_file + '.tmp'
+        self.gd_path_file_tmp = self.gd_path_file + '.tmp'
 
-        # get windrose settings
+        # get windrose settings, default to 1 day(= 86400 seconds)
         try:
-            self.wr_period = int(rtgd_config_dict.get('windrose_period',
-                                                      86400))
+            self.wr_period = int(my_config_dict.get('windrose_period',
+                                                    86400))
         except ValueError:
             self.wr_period = 86400
         try:
-            self.wr_points = int(rtgd_config_dict.get('windrose_points', 16))
+            self.wr_points = int(my_config_dict.get('windrose_points', 16))
         except ValueError:
             self.wr_points = 16
 
         # get our groups and format strings
-        self.date_format = rtgd_config_dict.get('date_format',
-                                                '%Y-%m-%d %H:%M')
+        self.date_format = my_config_dict.get('date_format', '%Y-%m-%d %H:%M')
         self.time_format = '%H:%M'
-        self.temp_group = rtgd_config_dict['Groups'].get('group_temperature',
-                                                         'degree_C')
-        self.pres_group = rtgd_config_dict['Groups'].get('group_pressure',
-                                                         'hPa')
-        self.pres_format = rtgd_config_dict['StringFormats'].get(self.pres_group,
-                                                                 '%.1f')
-        self.wind_group = rtgd_config_dict['Groups'].get('group_speed',
-                                                         'km_per_hour')
+        self.temp_group = my_config_dict['Groups'].get('group_temperature',
+                                                       'degree_C')
+        self.pres_group = my_config_dict['Groups'].get('group_pressure',
+                                                       'hPa')
+        self.pres_format = my_config_dict['StringFormats'].get(self.pres_group,
+                                                               '%.1f')
+        self.wind_group = my_config_dict['Groups'].get('group_speed',
+                                                       'km_per_hour')
         # Since the SteelSeries Weather Gauges derives distance units from wind
         # speed units we cannot use knots because WeeWX does not know how to
         # use distance in nautical miles. If we have been told to use knot then
         # default to mile_per_hour.
         if self.wind_group == 'knot':
             self.wind_group = 'mile_per_hour'
-        self.wind_format = rtgd_config_dict['StringFormats'].get(self.wind_group,
-                                                                 '%.1f')
-        self.rain_group = rtgd_config_dict['Groups'].get('group_rain',
-                                                         'mm')
+        self.wind_format = my_config_dict['StringFormats'].get(self.wind_group,
+                                                               '%.1f')
+        self.rain_group = my_config_dict['Groups'].get('group_rain', 'mm')
         # SteelSeries Weather Gauges don't understand cm so default to mm if we
         # have been told to use cm
         if self.rain_group == 'cm':
             self.rain_group = 'mm'
-        self.rain_format = rtgd_config_dict['StringFormats'].get(self.rain_group,
-                                                                 '%.1f')
+        self.rain_format = my_config_dict['StringFormats'].get(self.rain_group,
+                                                               '%.1f')
         self.dir_group = 'degree_compass'
-        self.dir_format = rtgd_config_dict['StringFormats'].get(self.dir_group,
-                                                                '%.1f')
+        self.dir_format = my_config_dict['StringFormats'].get(self.dir_group,
+                                                              '%.1f')
         self.rad_group = 'watt_per_meter_squared'
-        self.rad_format = rtgd_config_dict['StringFormats'].get(self.rad_group,
-                                                                '%.0f')
+        self.rad_format = my_config_dict['StringFormats'].get(self.rad_group,
+                                                              '%.0f')
         # SteelSeries Weather gauges derives windrun units from wind speed
         # units, so must we
         self.dist_group = GROUP_DIST[self.wind_group]
-        self.dist_format = rtgd_config_dict['StringFormats'].get(self.dist_group,
-                                                                 '%.1f')
-        self.alt_group = rtgd_config_dict['Groups'].get('group_altitude',
-                                                        'meter')
+        self.dist_format = my_config_dict['StringFormats'].get(self.dist_group,
+                                                               '%.1f')
+        self.alt_group = my_config_dict['Groups'].get('group_altitude',
+                                                      'meter')
         self.flag_format = '%.0f'
 
         # set up output units dict
         # first get the Groups config from our config dict
-        _config_units_dict = rtgd_config_dict.get('Groups', {})
+        _config_units_dict = my_config_dict.get('Groups', {})
         # group_rainrate needs special attention; it needs to match group_rain.
         # If group_rain does not exist omit group_rainrate as it will be
         # picked up from the defaults.
@@ -947,9 +943,9 @@ class RealtimeGaugeDataThread(threading.Thread):
         # add the Groups config to the chainmap and set the units_dict property
         self.units_dict = ListOfDicts(_config_units_dict, DEFAULT_UNITS)
         # setup the field map
-        _field_map = rtgd_config_dict.get('FieldMap', DEFAULT_FIELD_MAP)
+        _field_map = my_config_dict.get('FieldMap', DEFAULT_FIELD_MAP)
         # update the field map with any extensions
-        _extensions = rtgd_config_dict.get('FieldMapExtensions', {})
+        _extensions = my_config_dict.get('FieldMapExtensions', {})
         # update the field map with any extensions
         _field_map.update(_extensions)
 
@@ -974,7 +970,7 @@ class RealtimeGaugeDataThread(threading.Thread):
         self.field_map = _field_map
 
         # get max cache age
-        self.max_cache_age = rtgd_config_dict.get('max_cache_age', 600)
+        self.max_cache_age = my_config_dict.get('max_cache_age', 600)
 
         # initialise last wind directions for use when respective direction is
         # None. We need latest and average
@@ -983,13 +979,12 @@ class RealtimeGaugeDataThread(threading.Thread):
 
         # Are we updating windrun using archive data only or archive and loop
         # data?
-        self.windrun_loop = to_bool(rtgd_config_dict.get('windrun_loop',
-                                                         False))
+        self.windrun_loop = to_bool(my_config_dict.get('windrun_loop', False))
 
         # Lost contact
         # do we ignore the lost contact 'calculation'
-        self.ignore_lost_contact = to_bool(rtgd_config_dict.get('ignore_lost_contact',
-                                                                False))
+        self.ignore_lost_contact = to_bool(my_config_dict.get('ignore_lost_contact',
+                                                              False))
         # set the lost contact flag, assume we start off with contact
         self.lost_contact_flag = False
 
@@ -1006,26 +1001,19 @@ class RealtimeGaugeDataThread(threading.Thread):
 
         self.packet_cache = None
 
-        self.buffer = None
         self.rose = None
         self.last_rain_ts = None
 
         # initialise the scroller text
         self.scroller_text = None
 
-        # get some station info
-        self.latitude = latitude
-        self.longitude = longitude
-        self.altitude_m = altitude
-        self.station_type = config_dict['Station']['station_type']
-
         # gauge-data.txt version
         self.version = str(GAUGE_DATA_VERSION)
 
         # are we providing month and/or year to date rain, default is no we are
         # not
-        self.mtd_rain = to_bool(rtgd_config_dict.get('mtd_rain', False))
-        self.ytd_rain = to_bool(rtgd_config_dict.get('ytd_rain', False))
+        self.mtd_rain = to_bool(my_config_dict.get('mtd_rain', False))
+        self.ytd_rain = to_bool(my_config_dict.get('ytd_rain', False))
         # initialise some properties if we are providing month and/or year to
         # date rain
         if self.mtd_rain:
@@ -1035,47 +1023,25 @@ class RealtimeGaugeDataThread(threading.Thread):
 
         # obtain an object for exporting gauge-data.txt if required, if export
         # not required property will be set to None
-        self.exporter = self.export_factory(rtgd_config_dict,
-                                            self.rtgd_path_file)
+        self.exporter = self.export_factory(my_config_dict, self.gd_path_file)
+#        self.exporter = None
 
         # notify the user of a couple of things that we will do
         # frequency of generation
         if self.min_interval is None:
             _msg = "'%s' wil be generated. "\
-                       "min_interval is None" % self.rtgd_path_file
+                       "min_interval is None" % self.gd_path_file
         elif self.min_interval == 1:
             _msg = "'%s' will be generated. "\
-                       "min_interval is 1 second" % self.rtgd_path_file
+                       "min_interval is 1 second" % self.gd_path_file
         else:
             _msg = "'%s' will be generated. "\
-                       "min_interval is %s seconds" % (self.rtgd_path_file,
+                       "min_interval is %s seconds" % (self.gd_path_file,
                                                        self.min_interval)
         log.info(_msg)
         # lost contact
         if self.ignore_lost_contact:
             log.info("Sensor contact state will be ignored")
-
-    @staticmethod
-    def export_factory(rtgd_config_dict, rtgd_path_file):
-        """Factory method to produce an object to export gauge-data.txt."""
-
-        exporter = None
-        # do we have a legacy remote_server_url setting or a HttpPost stanza
-        if 'HttpPost' in rtgd_config_dict or 'remote_server_url' in rtgd_config_dict:
-            exporter = 'httppost'
-        elif 'Rsync' in rtgd_config_dict:
-            exporter = 'rsync'
-        exporter_class = EXPORTERS.get(exporter) if exporter else None
-        if exporter_class is None:
-            # We have no exporter specified or otherwise lacking the necessary
-            # config. Log this and return None which will result in nothing
-            # being exported (only saving of gauge-data.txt locally).
-            log.info("gauge-data.txt will not be exported.")
-            exporter_object = None
-        else:
-            # get the exporter object
-            exporter_object = exporter_class(rtgd_config_dict, rtgd_path_file)
-        return exporter_object
 
     def run(self):
         """Collect packets from the rtgd queue and manage their processing.
@@ -1190,7 +1156,7 @@ class RealtimeGaugeDataThread(threading.Thread):
                                 # Some unknown exception occurred. This is probably
                                 # a serious problem. Exit.
                                 log.critical("Unexpected exception of type %s" % (type(e),))
-                                weeutil.logger.log_traceback(log.debug, 'rtgdthread: **** ')
+                                weeutil.logger.log_traceback(log.debug, 'gdthread: **** ')
                                 log.critical("Thread exiting. Reason: %s" % (e, ))
                                 return
                     # if packets have backed up in the control queue, trim it until
@@ -1201,7 +1167,7 @@ class RealtimeGaugeDataThread(threading.Thread):
             # Some unknown exception occurred. This is probably
             # a serious problem. Exit.
             log.critical("Unexpected exception of type %s" % (type(e), ))
-            weeutil.logger.log_traceback(log.debug, 'rtgdthread: **** ')
+            weeutil.logger.log_traceback(log.debug, 'gdthread: **** ')
             log.critical("Thread exiting. Reason: %s" % (e, ))
             return
 
@@ -1222,19 +1188,20 @@ class RealtimeGaugeDataThread(threading.Thread):
                 log.debug("received cached loop packet (%s)" % packet['dateTime'])
             elif weewx.debug >= 3:
                 log.debug("received cached loop packet: %s" % (packet,))
-            # set our lost contact flag if applicable
-            self.lost_contact_flag = self.get_lost_contact(packet, 'loop')
+            # # set our lost contact flag if applicable
+            # self.lost_contact_flag = self.get_lost_contact(packet, 'loop')
             # get a data dict from which to construct our file
             try:
-                data = self.calculate(packet)
+                with self.buffer_lock:
+                    data = self.calculate(packet)
             except Exception as e:
-                weeutil.logger.log_traceback(log.info, 'rtgdthread: **** ')
+                weeutil.logger.log_traceback(log.info, 'gdthread: **** ')
             else:
                 # write to our file
                 try:
                     self.write_data(data)
                 except Exception as e:
-                    weeutil.logger.log_traceback(log.info, 'rtgdthread: **** ')
+                    weeutil.logger.log_traceback(log.info, 'gdthread: **** ')
                 else:
                     # set our write time
                     self.last_write = time.time()
@@ -1243,7 +1210,7 @@ class RealtimeGaugeDataThread(threading.Thread):
                         self.exporter.export(data)
                     # log the generation
                     if weewx.debug == 2:
-                        log.info("gauge-data.txt (%s) generated in %.5f seconds" % (cached_packet['dateTime'],
+                        log.info("gauge-data.txt (%s) generated in %.5f seconds" % (packet['dateTime'],
                                                                                     (self.last_write - t1)))
         else:
             # we skipped this packet so log it
@@ -1277,16 +1244,16 @@ class RealtimeGaugeDataThread(threading.Thread):
         # make the destination directory, wrapping it in a try block to catch
         # any errors
         try:
-            os.makedirs(self.rtgd_path)
+            os.makedirs(self.gd_path)
         except OSError as error:
             # raise if the error is anything other than the dir already exists
             if error.errno != errno.EEXIST:
                 raise
         # now write to temporary file
-        with open(self.rtgd_path_file_tmp, 'w') as f:
+        with open(self.gd_path_file_tmp, 'w') as f:
             json.dump(data, f, separators=(',', ':'), sort_keys=True)
         # and copy the temporary file to our destination
-        os.rename(self.rtgd_path_file_tmp, self.rtgd_path_file)
+        os.rename(self.gd_path_file_tmp, self.gd_path_file)
 
     def get_field_value(self, field, packet):
         """Obtain the value for an output field."""
